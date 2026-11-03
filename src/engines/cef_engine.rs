@@ -206,9 +206,112 @@ struct SharedState {
     /// Whether the focused DOM node accepts text — the cue a host needs to
     /// raise an on-screen keyboard.
     editable_focus: bool,
+    /// Whether a page the host navigates to waits for its content before it
+    /// replaces the one on screen. See `Engine::set_hold_on_navigation`.
+    hold_on_navigation: bool,
+    /// The navigation the page on screen is waiting for, while it waits.
+    hold: Option<Hold>,
+    /// Numbers each hold, so a late signal from an earlier page is ignored.
+    holds: u64,
+}
+
+/// The page on screen, kept while the next one the host asked for loads.
+///
+/// A navigation commits, then the new document paints its bare background,
+/// then its content. Shown frame by frame, every switch blinks: the old page
+/// under whatever the host drew for the new one, then an empty view, then the
+/// new page. Held, the view goes from one page to the next in a single frame.
+#[derive(Debug)]
+struct Hold {
+    /// Identifies this hold's "content is up" signal from the page.
+    id: u64,
+    /// The address asked for, to tell its load from one it replaced.
+    url: String,
+    /// When the new page said its content is laid out: its next frame ends
+    /// the hold.
+    ready_at: Option<std::time::Instant>,
+    /// When to stop waiting and show whatever the browser paints.
+    until: std::time::Instant,
+}
+
+impl Hold {
+    /// How long a page that never says it is ready keeps the old one up.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+    /// How long after the page is ready to wait for its frame before asking
+    /// for one. Asked at once, the browser may draw the frame before it.
+    const NUDGE: std::time::Duration = std::time::Duration::from_millis(32);
+
+    /// What the page logs once its content has been laid out and painted.
+    const READY_PREFIX: &str = "iced_webview:painted:";
+
+    fn new(id: u64, url: String, now: std::time::Instant) -> Self {
+        Self {
+            id,
+            url,
+            ready_at: None,
+            until: now + Self::TIMEOUT,
+        }
+    }
+
+    /// Whether a frame painted at `now` may replace the page on screen.
+    fn lets_frames_through(&self, now: std::time::Instant) -> bool {
+        self.ready_at.is_some() || now >= self.until
+    }
+
+    /// Whether a page that is ready has had time to paint without being asked:
+    /// a still page sends no frame of its own once it has painted.
+    fn wants_nudge(&self, now: std::time::Instant) -> bool {
+        self.ready_at
+            .is_some_and(|ready| now >= ready + Self::NUDGE)
+    }
+
+    /// Script run in the new document as it commits: once the DOM is parsed
+    /// and two frames have been laid out, it logs this hold's signal. Images
+    /// still loading do not delay it, unlike the load event.
+    fn ready_script(&self) -> String {
+        format!(
+            "(function(){{var go=function(){{requestAnimationFrame(function(){{\
+             requestAnimationFrame(function(){{console.log('{}{}');}});}});}};\
+             if(document.readyState==='loading'){{document.addEventListener(\
+             'DOMContentLoaded',go);}}else{{go();}}}})();",
+            Self::READY_PREFIX,
+            self.id
+        )
+    }
+
+    /// Whether `message` is this hold's signal. Any hold's signal is
+    /// swallowed rather than shown to the host, see `is_ready_signal`.
+    fn is_signalled_by(&self, message: &str) -> bool {
+        message
+            .strip_prefix(Self::READY_PREFIX)
+            .and_then(|id| id.parse::<u64>().ok())
+            == Some(self.id)
+    }
+
+    /// Whether `message` is a hold's signal at all, current or not.
+    fn is_ready_signal(message: &str) -> bool {
+        message.starts_with(Self::READY_PREFIX)
+    }
 }
 
 impl SharedState {
+    /// Start holding the page on screen until `url` is ready.
+    fn hold_for(&mut self, url: String) {
+        if !self.hold_on_navigation {
+            return;
+        }
+        self.holds = self.holds.wrapping_add(1);
+        self.hold = Some(Hold::new(self.holds, url, std::time::Instant::now()));
+    }
+
+    /// Whether a frame painted now must wait, the page on screen being held.
+    fn holding_frames(&self) -> bool {
+        self.hold
+            .as_ref()
+            .is_some_and(|hold| !hold.lets_frames_through(std::time::Instant::now()))
+    }
+
     /// How long to keep asking CEF for a correctly-sized frame.
     ///
     /// Long enough to cover the capturer catching up (measured at 10-30ms),
@@ -722,6 +825,12 @@ wrap_render_handler! {
                 Arc::make_mut(&mut shared.persistent_buffer).copy_from_slice(src);
             }
 
+            // The buffer keeps up with the new page, copy-on-write, while the
+            // frame on show stays the old page's until the new one is ready.
+            if shared.holding_frames() {
+                return;
+            }
+            shared.hold = None;
             shared.frame_buffer = Some((Arc::clone(&shared.persistent_buffer), w, h));
         }
 
@@ -801,6 +910,10 @@ wrap_render_handler! {
                 if shared.standing_in && shared.expected_pixels != Some((width, height)) {
                     return;
                 }
+                // The page on show is held: this frame would replace it.
+                if shared.holding_frames() {
+                    return;
+                }
             }
 
             // Take the surface out from under the borrow: importing blocks on
@@ -812,7 +925,9 @@ wrap_render_handler! {
             };
 
             if surface.accept_frame(&frame) {
-                self.shared.borrow_mut().accelerated_size = (width, height);
+                let mut shared = self.shared.borrow_mut();
+                shared.accelerated_size = (width, height);
+                shared.hold = None;
             }
         }
     }
@@ -858,9 +973,17 @@ wrap_display_handler! {
             source: Option<&CefString>,
             line: c_int,
         ) -> c_int {
+            let message = message.map(|m| m.to_string()).unwrap_or_default();
+            if Hold::is_ready_signal(&message) {
+                let mut shared = self.shared.borrow_mut();
+                if let Some(hold) = shared.hold.as_mut().filter(|h| h.is_signalled_by(&message)) {
+                    hold.ready_at = Some(std::time::Instant::now());
+                }
+                return 1; // the host's console never sees it
+            }
             self.shared.borrow_mut().console_messages.push(ConsoleMessage {
                 level: level.get_raw() as i32,
-                message: message.map(|m| m.to_string()).unwrap_or_default(),
+                message,
                 source: source.map(|s| s.to_string()).unwrap_or_default(),
                 line: line as i32,
             });
@@ -960,6 +1083,29 @@ wrap_load_handler! {
             }
         }
 
+        // The held-for page has committed: have it say when its content is up.
+        fn on_load_start(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _transition_type: TransitionType,
+        ) {
+            let Some(frame) = frame.filter(|f| f.is_main() != 0) else {
+                return;
+            };
+            let script = {
+                let shared = self.shared.borrow();
+                let Some(hold) = shared.hold.as_ref() else {
+                    return;
+                };
+                if !held_page_is(hold, frame) {
+                    return;
+                }
+                hold.ready_script()
+            };
+            frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
+        }
+
         // Off-screen rendering has no window manager handing focus back, so
         // without this a page reached by redirect drops keystrokes until the
         // user clicks inside it.
@@ -998,6 +1144,13 @@ wrap_load_handler! {
 
             let text = error_text.map(ToString::to_string).unwrap_or_default();
             let url = failed_url.map(ToString::to_string).unwrap_or_default();
+            // The held-for page will not come: show what the browser paints.
+            {
+                let mut shared = self.shared.borrow_mut();
+                if shared.hold.as_ref().is_some_and(|hold| hold.url == url) {
+                    shared.hold = None;
+                }
+            }
             log::warn!(
                 "iced_webview: load failed ({error_code:?}) for {}: {text}",
                 url.chars().take(160).collect::<String>()
@@ -1037,6 +1190,23 @@ wrap_load_handler! {
             frame.load_url(Some(&CefString::from(data_url.as_str())));
         }
     }
+}
+
+/// Whether `frame` holds the page `hold` waits for, rather than one it
+/// replaced whose load is reported late.
+fn held_page_is(hold: &Hold, frame: &Frame) -> bool {
+    let url = CefString::from(&frame.url()).to_string();
+    let same = url == hold.url;
+    if !same {
+        log::debug!(
+            "iced_webview: a load of {}… ({}B) while holding for {}… ({}B)",
+            url.chars().take(48).collect::<String>(),
+            url.len(),
+            hold.url.chars().take(48).collect::<String>(),
+            hold.url.len()
+        );
+    }
+    same
 }
 
 /// The start of the inline error page `on_load_error` renders.
@@ -1266,6 +1436,8 @@ struct CefView {
     click_count: c_int,
     /// CEF event-flag bitmask for currently held mouse buttons.
     pressed_buttons: u32,
+    /// Whether `last_frame` is still the page from before a held navigation.
+    showing_previous: bool,
 }
 
 /// Minimal state kept for a suspended view so it can be resumed later
@@ -1429,6 +1601,9 @@ pub struct Cef {
     /// When `true`, new views block top-level navigation away from their
     /// loaded document (see `set_block_navigation`). Off by default.
     block_navigation: bool,
+    /// When `true`, views keep their page on screen while the next one the
+    /// host asks for loads (see `set_hold_on_navigation`). Off by default.
+    hold_on_navigation: bool,
     /// `User-Agent` to present, or `None` for the CEF default.
     /// Applied per view (see `Engine::set_user_agent`).
     user_agent: Option<String>,
@@ -1456,6 +1631,7 @@ impl Default for Cef {
             init_error: None,
             background_color: None,
             block_navigation: false,
+            hold_on_navigation: false,
             user_agent: None,
             quiet_failures: None,
             private: false,
@@ -1593,6 +1769,9 @@ impl Cef {
             popup_rect: None,
             eval_results: Vec::new(),
             editable_focus: false,
+            hold_on_navigation: self.hold_on_navigation,
+            hold: None,
+            holds: 0,
         }));
 
         let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
@@ -1668,6 +1847,7 @@ impl Cef {
             last_click: None,
             click_count: 0,
             pressed_buttons: 0,
+            showing_previous: false,
         })
     }
 }
@@ -1718,12 +1898,6 @@ impl Engine for Cef {
         for view in &mut self.views {
             let mut shared = view.shared.borrow_mut();
 
-            // The surface has to reach the renderer before the first frame,
-            // not after it: the renderer is the only thing that knows which
-            // GPU device exists, and until it has told the surface, every
-            // frame the browser paints is dropped. Publishing an empty one
-            // (which draws nothing) is what breaks that circle.
-            let delivered = shared.accelerated.frame_count();
             let mut needs_repaint = false;
             if accelerated_paint_enabled() {
                 if view.last_frame.accelerated().is_none() {
@@ -1742,9 +1916,45 @@ impl Engine for Cef {
                 }
             }
 
+            // A held-for page that is ready shows on its next frame, asked for
+            // if it does not come. One that never got ready shows whatever the
+            // browser has painted by now.
+            let now = std::time::Instant::now();
+            if shared
+                .hold
+                .as_ref()
+                .is_some_and(|hold| hold.wants_nudge(now))
+            {
+                needs_repaint = true;
+            } else if shared
+                .hold
+                .as_ref()
+                .is_some_and(|hold| hold.ready_at.is_none() && hold.lets_frames_through(now))
+            {
+                log::debug!("iced_webview: the next page never said it was ready");
+                shared.hold = None;
+                needs_repaint = true;
+                let (w, h) = shared.persistent_size;
+                if !accelerated_paint_enabled() && w > 0 && h > 0 {
+                    shared.frame_buffer = Some((Arc::clone(&shared.persistent_buffer), w, h));
+                }
+            }
+
+            // Ask before handing frames over: `invalidate` can paint at once,
+            // and that frame belongs with this tick, not the next. The handler
+            // it calls wants this same `RefCell`.
+            if needs_repaint {
+                drop(shared);
+                if let Some(host) = view.browser.host() {
+                    host.invalidate(PaintElementType::VIEW);
+                }
+                shared = view.shared.borrow_mut();
+            }
+
             // On the accelerated path the frame is already a texture, so there
             // is nothing to hand over but the surface itself — republished
             // only when the browser has actually painted since last time.
+            let delivered = shared.accelerated.frame_count();
             if delivered > shared.accelerated_seen {
                 shared.accelerated_seen = delivered;
                 let (w, h) = shared.accelerated_size;
@@ -1774,14 +1984,9 @@ impl Engine for Cef {
                 view.title = title;
             }
             view.cursor = cursor_type_to_interaction(shared.cursor_type);
-
-            // Every handler CEF may call from here wants this borrow.
-            drop(shared);
-            if needs_repaint {
-                if let Some(host) = view.browser.host() {
-                    host.invalidate(PaintElementType::VIEW);
-                }
-            }
+            // A CPU frame is on show once handed over here, so the held page
+            // gives way with it, not when the browser painted.
+            view.showing_previous = shared.hold.is_some();
         }
     }
 
@@ -1988,6 +2193,29 @@ impl Engine for Cef {
             *pending = locale.clone();
         }
         self.locale = locale;
+    }
+
+    fn set_hold_on_navigation(&mut self, hold: bool) {
+        self.hold_on_navigation = hold;
+        for view in &mut self.views {
+            let mut shared = view.shared.borrow_mut();
+            shared.hold_on_navigation = hold;
+            if !hold {
+                shared.hold = None;
+            }
+        }
+    }
+
+    fn showing_previous_page(&self, id: ViewId) -> bool {
+        // A GPU frame lands in the texture on show as the browser paints it;
+        // a CPU one only when `update` hands it over.
+        self.find_view(id).is_some_and(|view| {
+            if accelerated_paint_enabled() {
+                view.shared.borrow().hold.is_some()
+            } else {
+                view.showing_previous
+            }
+        })
     }
 
     fn set_block_navigation(&mut self, block: bool) {
@@ -2262,7 +2490,11 @@ impl Engine for Cef {
         match page_type {
             PageType::Url(url) => {
                 view.url = url.clone();
-                view.shared.borrow_mut().host_document = Some(without_fragment(&url).to_owned());
+                {
+                    let mut shared = view.shared.borrow_mut();
+                    shared.host_document = Some(without_fragment(&url).to_owned());
+                    shared.hold_for(url.clone());
+                }
                 let cef_url = CefString::from(url.as_str());
                 frame.load_url(Some(&cef_url));
             }
@@ -2271,10 +2503,12 @@ impl Engine for Cef {
                     "data:text/html;charset=utf-8,{}",
                     urlencoding::encode(&html)
                 );
+                view.shared.borrow_mut().hold_for(data_url.clone());
                 let cef_url = CefString::from(data_url.as_str());
                 frame.load_url(Some(&cef_url));
             }
         }
+        view.showing_previous = view.shared.borrow().hold.is_some();
     }
 
     fn execute_javascript(&mut self, id: ViewId, code: &str) {
@@ -2697,3 +2931,55 @@ fn iced_key_to_cef(key: &keyboard::Key) -> Option<(i32, u16)> {
     }
 }
 
+#[cfg(test)]
+mod hold_tests {
+    use super::Hold;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn frames_wait_until_the_page_is_ready() {
+        let now = Instant::now();
+        let mut hold = Hold::new(7, "data:text/html,b".into(), now);
+        assert!(!hold.lets_frames_through(now), "the old page stays up");
+        hold.ready_at = Some(now);
+        assert!(
+            hold.lets_frames_through(now),
+            "the new page's next frame shows"
+        );
+    }
+
+    #[test]
+    fn a_ready_page_is_asked_for_a_frame_only_if_none_comes() {
+        let now = Instant::now();
+        let mut hold = Hold::new(3, String::new(), now);
+        assert!(
+            !hold.wants_nudge(now + Hold::TIMEOUT),
+            "not before it is ready"
+        );
+        hold.ready_at = Some(now);
+        assert!(!hold.wants_nudge(now), "its own frame may be on the way");
+        assert!(hold.wants_nudge(now + Hold::NUDGE));
+    }
+
+    #[test]
+    fn a_page_that_never_says_so_shows_after_the_timeout() {
+        let now = Instant::now();
+        let hold = Hold::new(1, String::new(), now);
+        assert!(!hold.lets_frames_through(now + Hold::TIMEOUT - Duration::from_millis(1)));
+        assert!(hold.lets_frames_through(now + Hold::TIMEOUT));
+    }
+
+    #[test]
+    fn only_this_holds_signal_ends_it() {
+        let hold = Hold::new(12, String::new(), Instant::now());
+        assert!(hold.ready_script().contains("iced_webview:painted:12"));
+        assert!(hold.is_signalled_by("iced_webview:painted:12"));
+        assert!(
+            !hold.is_signalled_by("iced_webview:painted:11"),
+            "an earlier page's"
+        );
+        assert!(!hold.is_signalled_by("iced_webview:painted:120"));
+        assert!(Hold::is_ready_signal("iced_webview:painted:11"));
+        assert!(!Hold::is_ready_signal("mailattachment:4"));
+    }
+}

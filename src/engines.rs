@@ -168,6 +168,19 @@ pub trait Engine {
     /// engines that don't support it.
     fn set_block_navigation(&mut self, _block: bool) {}
 
+    /// Keep a view's page on screen while the next one the host asks for
+    /// loads, and swap to it in one frame once its content is laid out (or
+    /// after a second, if it never says so). Off by default: a view shows
+    /// each frame the browser paints, the new page's empty ones included.
+    /// Default is no-op for engines that don't support it.
+    fn set_hold_on_navigation(&mut self, _hold: bool) {}
+
+    /// Whether a view still shows the page from before the host's last
+    /// navigation, held by [`Self::set_hold_on_navigation`].
+    fn showing_previous_page(&self, _id: ViewId) -> bool {
+        false
+    }
+
     /// Override the `User-Agent` for views created from now on.
     ///
     /// Some sites gate their flow on the UA — Epic Games' account portal only
