@@ -238,6 +238,22 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self
     }
 
+    /// Keep the page on screen while the next one loads, and swap to it in
+    /// one frame once its content is laid out: no empty view in between.
+    /// For a viewer whose host draws something with each page (a title, a
+    /// toolbar), [`Self::showing_previous_page`] says which page is up.
+    pub fn hold_on_navigation(mut self) -> Self {
+        self.engine.set_hold_on_navigation(true);
+        self
+    }
+
+    /// Whether the view still shows the page from before the last
+    /// [`Action::GoToUrl`], held by [`Self::hold_on_navigation`].
+    pub fn showing_previous_page(&self) -> bool {
+        self.current_view_id()
+            .is_some_and(|view_id| self.engine.showing_previous_page(view_id))
+    }
+
     /// Present `user_agent` instead of the engine default.
     ///
     /// Applies to views created afterwards, so it can be changed between flows
