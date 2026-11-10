@@ -543,6 +543,20 @@ wrap_browser_process_handler! {
                 Some(&CefString::from(paint)),
             );
         }
+
+        // Another process started on this profile. Left to CEF, it opens a
+        // free-standing Chrome window with that process's arguments as tabs.
+        fn on_already_running_app_relaunch(
+            &self,
+            command_line: Option<&mut CommandLine>,
+            _current_directory: Option<&CefString>,
+        ) -> c_int {
+            let args = command_line
+                .map(|cmd| CefString::from(&cmd.command_line_string()).to_string())
+                .unwrap_or_default();
+            log::warn!("iced_webview: ignoring a second browser on this profile: {args}");
+            1
+        }
     }
 }
 
@@ -1508,12 +1522,15 @@ fn ensure_cef_initialized() -> (bool, Option<&'static str>) {
             .ok()
             .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "default".to_string());
-        let cef_cache = format!("{cache_dir}/iced_webview_cef/{app}");
-        let _ = std::fs::create_dir_all(&cef_cache);
-
-        // Clear the singleton files left by a run that died, but only from a
-        // profile no running instance holds (see `cef_profile`).
-        super::cef_profile::claim_and_clear(std::path::Path::new(&cef_cache));
+        // And per running instance: a second one on a held profile would hand
+        // its launch to the first, which opens it as a Chrome window.
+        let root = std::path::PathBuf::from(format!("{cache_dir}/iced_webview_cef/{app}"));
+        let Some(profile) = super::cef_profile::claim_free(&root) else {
+            let msg = format!("every CEF profile next to {} is in use", root.display());
+            log::error!("iced_webview: {msg}");
+            return Some(msg);
+        };
+        let cef_cache = profile.to_string_lossy().into_owned();
 
         let cef_dir = match cef::sys::get_cef_dir() {
             Some(dir) => dir,
