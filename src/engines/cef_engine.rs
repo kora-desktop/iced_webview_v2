@@ -1573,6 +1573,15 @@ fn ensure_cef_initialized() -> (bool, Option<&'static str>) {
 
         let mut app = OsrApp::new();
 
+        // CEF's initialize() replaces the process's SIGINT and SIGTERM
+        // handlers. Keep the ones the app had, so an app that saves its work
+        // on SIGTERM still does once a webview exists.
+        let kept = [libc::SIGINT, libc::SIGTERM].map(|signal| {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            let read = unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) };
+            (signal, (read == 0).then_some(action))
+        });
+
         let result = initialize(
             Some(args.as_main_args()),
             Some(&settings),
@@ -1589,11 +1598,17 @@ fn ensure_cef_initialized() -> (bool, Option<&'static str>) {
             return Some(msg);
         }
 
-        // CEF's initialize() installs its own signal handlers that swallow
-        // SIGINT — restore the default so a single Ctrl+C terminates the app.
-        unsafe {
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
-            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        // CEF's handlers swallow SIGINT. Put back what was there before, the
+        // default unless the app set its own, so one Ctrl+C still ends it.
+        for (signal, action) in kept {
+            match action {
+                Some(action) => unsafe {
+                    libc::sigaction(signal, &action, std::ptr::null_mut());
+                },
+                None => unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                },
+            }
         }
 
         CEF_INITIALIZED.store(true, Ordering::Release);
