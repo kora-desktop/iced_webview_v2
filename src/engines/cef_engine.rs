@@ -632,21 +632,7 @@ wrap_app! {
                 // is bound, which this feature gates, so turning it off puts
                 // us back on the code path headless and x11 already take.
                 // Verified not to affect dmabuf delivery.
-                //
-                // Merge rather than replace: CEF has already put its own
-                // entries here and clobbering them would re-enable features it
-                // deliberately turned off.
-                let mut disabled =
-                    CefString::from(&cmd.switch_value(Some(&CefString::from("disable-features"))))
-                        .to_string();
-                if !disabled.is_empty() {
-                    disabled.push(',');
-                }
-                disabled.push_str("WaylandFractionalScaleV1");
-                cmd.append_switch_with_value(
-                    Some(&CefString::from("disable-features")),
-                    Some(&CefString::from(disabled.as_str())),
-                );
+                disable_features(cmd, &["WaylandFractionalScaleV1"]);
                 // ANGLE must go through EGL for the dmabuf export to work. The
                 // fallback path uses X11 pixmaps, which only Mesa implements —
                 // CEF makes the same choice for its own shared-texture sample.
@@ -710,6 +696,10 @@ wrap_app! {
                 cmd.append_switch(Some(&CefString::from("disable-gpu-compositing")));
             }
             cmd.append_switch(Some(&CefString::from("disable-gpu-shader-disk-cache")));
+            // Chrome's WebUSB detector opens every USB 2.1+ device at startup
+            // to read its landing page, for a notification a webview never
+            // shows. Pages can still ask for USB through `navigator.usb`.
+            disable_features(cmd, &["WebUsbDeviceDetection"]);
             cmd.append_switch(Some(&CefString::from("enable-accelerated-2d-canvas")));
             cmd.append_switch_with_value(
                 Some(&CefString::from("enable-features")),
@@ -719,6 +709,27 @@ wrap_app! {
             );
         }
     }
+}
+
+/// Adds `features` to Chromium's `disable-features` switch. Merged rather than
+/// replaced: CEF has already put its own entries there, and clobbering them
+/// would turn back on features it deliberately turned off.
+fn disable_features(cmd: &mut CommandLine, features: &[&str]) {
+    let name = CefString::from("disable-features");
+    let current = CefString::from(&cmd.switch_value(Some(&name))).to_string();
+    let merged = merge_feature_list(&current, features);
+    cmd.append_switch_with_value(Some(&name), Some(&CefString::from(merged.as_str())));
+}
+
+/// `current`, a comma-separated feature list, with `features` appended once.
+fn merge_feature_list(current: &str, features: &[&str]) -> String {
+    let mut list: Vec<&str> = current.split(',').filter(|f| !f.is_empty()).collect();
+    for feature in features {
+        if !list.contains(feature) {
+            list.push(feature);
+        }
+    }
+    list.join(",")
 }
 
 // -- CEF handler implementations via wrap macros --
@@ -2960,6 +2971,25 @@ fn iced_key_to_cef(key: &keyboard::Key) -> Option<(i32, u16)> {
             Some((vk, ch))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod feature_list_tests {
+    use super::merge_feature_list;
+
+    #[test]
+    fn keeps_what_is_already_disabled() {
+        assert_eq!(
+            merge_feature_list("BackForwardCache,Translate", &["WebUsbDeviceDetection"]),
+            "BackForwardCache,Translate,WebUsbDeviceDetection"
+        );
+    }
+
+    #[test]
+    fn starts_a_list_and_adds_each_feature_once() {
+        assert_eq!(merge_feature_list("", &["A"]), "A");
+        assert_eq!(merge_feature_list("A", &["A", "B"]), "A,B");
     }
 }
 
